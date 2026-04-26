@@ -8,11 +8,6 @@ import "../src/ExecutionLayerFeeDispatcher.sol";
 import "../src/FeeRecipient.sol";
 import "../src/interfaces/ISanctionsOracle.sol";
 
-/*
-    KILN V1 CRITICAL EXPLOIT: PERMANENT TREASURY LOCK
-    Finding: Protocol revenue (fees) is permanently locked if a validator owner is sanctioned.
-*/
-
 contract MockSanctionsOracle is ISanctionsOracle {
     mapping(address => bool) public sanctioned;
     function setSanctioned(address _addr, bool _val) external { sanctioned[_addr] = _val; }
@@ -68,21 +63,19 @@ contract KilnTreasuryLockTest is Test {
         vm.prank(user);
         staking.deposit{value: 32 ether}();
         
-        // Accumulate rewards in the clones
         address clClone = staking.getCLFeeRecipient(publicKey);
         address elClone = staking.getELFeeRecipient(publicKey);
         vm.deal(clClone, 1 ether);
         vm.deal(elClone, 1 ether);
         
-        // USER becomes sanctioned
+        // Sanction the user
         oracle.setSanctioned(user, true);
         
-        // ADMIN (KILN) attempts to collect their 5% fee -> REVERTS
+        // Protocol withdrawal reverts due to sanctioned withdrawer address
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSignature("AddressSanctioned(address)", user)); 
         staking.withdraw(publicKey);
         
-        // Result: 0.1 ETH in fees (5% of 2 ETH) is held hostage in the clones
         assertEq(address(treasury).balance, 0, "Treasury should have received 0 fees");
     }
 }

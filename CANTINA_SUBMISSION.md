@@ -1,4 +1,4 @@
-# Permanent Protocol Fee Lock via Sanctions Oracle Logic
+# Protocol Fee Lock via Sanctions Oracle Logic
 
 **Submitted by**: Omachoko Yakubu, Security Researcher
 **Date**: 25 April 2026
@@ -8,64 +8,48 @@
 
 ---
 
-## 1. Finding Description
+## Vulnerability Description
+The Kiln V1 staking infrastructure contains a logic flaw that leads to the permanent locking of protocol fees (Treasury and Operator commissions) when a validator's withdrawer address is sanctioned. 
 
-### Brief
-A critical logic flaw in the Kiln V1 Staking infrastructure leads to the permanent locking of protocol fees (Treasury and Operator commissions) whenever a validator's withdrawer address is sanctioned. Because the `SanctionsOracle` check triggers a global revert during the `dispatch()` process, Kiln's own revenue is held hostage by the user's sanction status. There is no administrative rescue path, leading to permanent protocol insolvency for the affected validator rewards.
+The `SanctionsOracle` check triggers a global revert during the `dispatch()` process, holding Kiln's revenue hostage to the user's sanction status. There is no administrative bypass, resulting in permanent protocol insolvency for rewards associated with affected validators.
 
-### Details
-The Kiln V1 protocol uses deterministic `FeeRecipient` clones to manage reward splits. When a withdrawal is initiated (via `withdraw()` in `StakingContract.sol`), the contract calls the `dispatch()` function on either the `ConsensusLayerFeeDispatcher` or `ExecutionLayerFeeDispatcher`.
+### Technical Analysis
+Kiln V1 utilizes `FeeRecipient` clones for reward management. During withdrawal (invoked via `StakingContract.withdraw()`), the contract calls `dispatch()` on either the `ConsensusLayerFeeDispatcher` or `ExecutionLayerFeeDispatcher`.
 
-Inside the `dispatch()` function, the very first step is to identify the user's `withdrawer` address:
+The `dispatch()` function first identifies the `withdrawer` address:
 ```solidity
 address withdrawer = stakingContract.getWithdrawerFromPublicKeyRoot(_publicKeyRoot);
 ```
 
-The `getWithdrawerFromPublicKeyRoot` function in `StakingContract.sol` invokes the `_revertIfSanctionedOrBlocked(withdrawer)` internal check. If the Oracle identifies the user as sanctioned, **the call reverts immediately.**
+The `getWithdrawerFromPublicKeyRoot` function in `StakingContract.sol` performs an internal check: `_revertIfSanctionedOrBlocked(withdrawer)`. If the user is sanctioned, the call reverts.
 
-### The Logic Trap
-Because this revert happens at the start of the `dispatch` logic, the entire transaction rollbacks. Crucially, the logic that follows—which is responsible for sending the protocol's 5%–10% commission to the Kiln Treasury and Operator—is **never reached**.
+### Logic Failure
+Because the revert occurs at the start of the `dispatch` logic, the entire transaction rollbacks. The subsequent logic—responsible for distributing the 5%-10% commission to the Kiln Treasury and Operator—is never reached. 
 
-Kiln (the Admin) cannot bypass this check to collect their fees because the check is performed on the *withdrawer* (the user), not the *caller* (the Admin). This results in a "Self-Griefing" scenario where the protocol's own compliance logic prevents it from accessing its earned revenue.
-
----
-
-## 2. Impact: Critical (Protocol Treasury Loss)
-
-This vulnerability represents a direct and permanent loss of protocol revenue.
-
-1.  **Total Value Locked (TVL)**: Kiln manages approximately **550,000 ETH ($1.8 Billion USD)** in its V1 infrastructure.
-2.  **Revenue at Risk**: Based on a standard 4% APR and a 10% Kiln fee, the protocol generates roughly **2,200 ETH ($7.2M USD)** in commission annually.
-3.  **Hostage Funds**: Any high-TVL institutional user who becomes sanctioned effectively "poisons" their validator's clones. Kiln's earned commission from these validators (which could be millions of dollars) is permanently trapped in the smart contract bytecode with no rescue mechanism.
+Since the check is performed on the *withdrawer* (user) rather than the *caller* (Admin), Kiln cannot bypass this check to collect earned fees. This creates a "self-griefing" scenario where the protocol's compliance logic prevents its own revenue collection.
 
 ---
 
-## 3. Proof of Concept
+## Impact Assessment
+This vulnerability results in a permanent loss of protocol revenue.
 
-### Environment
-- **Framework**: Foundry (Forge)
-- **Network**: Forked Mainnet (Simulated state)
-- **Repo**: `kiln-treasury-hostage-poc`
+1.  **TVL Exposure**: Kiln manages approx. 550,000 ETH ($1.8B) in V1.
+2.  **Revenue at Risk**: Based on 4% APR and a 10% protocol fee, approximately 2,200 ETH ($7.2M) in commission is generated annually.
+3.  **Hostage State**: Sanctioned institutional users effectively "poison" their validator clones. The protocol's earned commission is trapped in the bytecode with no recovery path.
 
-### Reproduction
+---
+
+## Proof of Concept
+
+### Reproduction Steps
 ```bash
 git clone https://github.com/OmachokoYakubu/kiln-treasury-hostage-poc
 cd kiln-treasury-hostage-poc
-
-# Run the dedicated treasury lock exploit
 forge test --match-path test/KilnTreasuryLock.t.sol -vvvv
 ```
 
-### Exploit Path (Verified Trace)
-The trace in `EXPLOIT_PROOF.txt` confirms:
-1. `StakingContract::withdraw()` is called by the Admin.
-2. The call enters `ConsensusLayerFeeDispatcher::dispatch()`.
-3. The dispatcher queries `getWithdrawerFromPublicKeyRoot()`.
-4. The call fails with `AddressSanctioned(user)`.
-5. The transaction reverts, leaving the Treasury balance at **0 ETH** while the clone retains the protocol fees.
-
-### Verbose Execution Trace
-The following trace confirms the `AddressSanctioned` revert occurs deep within the `dispatch` call, aborting the fee distribution:
+### Execution Trace
+The following trace confirms the `AddressSanctioned` revert occurs during a `withdraw()` call, aborting fee distribution:
 
 ```text
 Traces:
@@ -79,27 +63,20 @@ Traces:
     │   │   │   │   │   ├─ [515] MockSanctionsOracle::isSanctioned(0xDE) [staticcall]
     │   │   │   │   │   │   └─ ← [Return] true
     │   │   │   │   │   └─ ← [Revert] AddressSanctioned(0xDE)
-    │   │   │   │   └─ ← [Revert] AddressSanctioned(0xDE)
-    │   │   │   └─ ← [Revert] AddressSanctioned(0xDE)
-    │   │   └─ ← [Revert] AddressSanctioned(0xDE)
-    │   └─ ← [Revert] AddressSanctioned(0xDE)
 ```
 
 ---
 
-## 4. Recommended Fix: Verified Fault-Tolerant Dispatch
+## Remediation
+I recommend implementing a fault-tolerant dispatch pattern using a `try/catch` block. This allows the protocol to salvage its revenue while safely escrowing the user's portion.
 
-I recommend implementing a **Fault-Tolerant Dispatch** pattern that uses a `try/catch` block to handle sanctions-related reverts gracefully. This ensures that the protocol can salvage its revenue while safely escrowing the user's portion.
-
-### Technical Implementation
-
-Modify the `dispatch()` function in both `ConsensusLayerFeeDispatcher.sol` and `ExecutionLayerFeeDispatcher.sol` as follows:
+### Implementation
+Modify `dispatch()` in the fee dispatchers:
 
 ```solidity
 address withdrawer;
 bool isSanctioned;
 
-// Use try/catch to prevent the Oracle revert from killing the entire transaction
 try stakingContract.getWithdrawerFromPublicKeyRoot(_publicKeyRoot) returns (address w) {
     withdrawer = w;
 } catch {
@@ -107,17 +84,10 @@ try stakingContract.getWithdrawerFromPublicKeyRoot(_publicKeyRoot) returns (addr
 }
 
 if (!isSanctioned) {
-    (bool status, bytes memory data) = withdrawer.call{value: balance - globalFee}("");
-    if (status == false) {
-        revert WithdrawerReceiveError(data);
-    }
+    (bool status, ) = withdrawer.call{value: balance - globalFee}("");
+    if (!status) revert WithdrawerReceiveError();
 }
-// If sanctioned, the user's portion remains safely in the contract (Pull-based Escrow).
-// The logic continues to ensure protocol fees are distributed.
-
-// ... Continue to Treasury and Operator fee distribution ...
+// If sanctioned, protocol fee distribution continues below...
 ```
 
-### Verification Result
-This fix has been verified in `test/KilnTreasuryLock_Fixed.t.sol`. In the patched environment, the **Treasury successfully collected its 5% fee** despite the user being sanctioned, proving the protocol's solvency is restored.
-
+This fix ensures protocol solvency is maintained even during sanctions events.
