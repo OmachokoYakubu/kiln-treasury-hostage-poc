@@ -8,48 +8,34 @@
 
 ---
 
-## Vulnerability Description
-The Kiln V1 staking infrastructure contains a logic flaw that leads to the permanent locking of protocol fees (Treasury and Operator commissions) when a validator's withdrawer address is sanctioned. 
+## Summary
+A critical logic flaw in Kiln V1 causes protocol revenue (Treasury and Operator fees) to be permanently locked if a validator owner is sanctioned.
 
-The `SanctionsOracle` check triggers a global revert during the `dispatch()` process, holding Kiln's revenue hostage to the user's sanction status. There is no administrative bypass, resulting in permanent protocol insolvency for rewards associated with affected validators.
+## Finding Description
+The Kiln V1 staking infrastructure uses `FeeRecipient` clones to manage reward splits. During the withdrawal process (invoked via `StakingContract.withdraw()`), the contract calls `dispatch()` on a fee dispatcher. 
 
-### Technical Analysis
-Kiln V1 utilizes `FeeRecipient` clones for reward management. During withdrawal (invoked via `StakingContract.withdraw()`), the contract calls `dispatch()` on either the `ConsensusLayerFeeDispatcher` or `ExecutionLayerFeeDispatcher`.
+The `dispatch()` function attempts to retrieve the `withdrawer` address using `stakingContract.getWithdrawerFromPublicKeyRoot(_publicKeyRoot)`. However, `getWithdrawerFromPublicKeyRoot` contains an internal call to `_revertIfSanctionedOrBlocked(withdrawer)`. 
 
-The `dispatch()` function first identifies the `withdrawer` address:
-```solidity
-address withdrawer = stakingContract.getWithdrawerFromPublicKeyRoot(_publicKeyRoot);
-```
+If the user associated with that validator is sanctioned, the function reverts the entire transaction. This breaks the security guarantee of protocol revenue isolation; because the revert occurs at the start of the `dispatch` logic, the code responsible for distributing the 5%-10% Kiln commission to the Treasury and Operator is never reached. Since there is no administrative bypass, Kiln is blocked from collecting its own earned fees whenever a user is sanctioned.
 
-The `getWithdrawerFromPublicKeyRoot` function in `StakingContract.sol` performs an internal check: `_revertIfSanctionedOrBlocked(withdrawer)`. If the user is sanctioned, the call reverts.
+## Impact Explanation
+I have assessed this as **Critical** because it leads to a permanent loss of protocol revenue with no recovery path. Kiln manages approximately 550,000 ETH ($1.8B) in its V1 infrastructure, generating roughly $7.2M USD in commission annually. Any high-TVL institutional user who becomes sanctioned effectively "poisons" the validator's clones, holding the protocol's earned commission hostage indefinitely.
 
-### Logic Failure
-Because the revert occurs at the start of the `dispatch` logic, the entire transaction rollbacks. The subsequent logic—responsible for distributing the 5%-10% commission to the Kiln Treasury and Operator—is never reached. 
-
-Since the check is performed on the *withdrawer* (user) rather than the *caller* (Admin), Kiln cannot bypass this check to collect earned fees. This creates a "self-griefing" scenario where the protocol's compliance logic prevents its own revenue collection.
-
----
-
-## Impact Assessment
-This vulnerability results in a permanent loss of protocol revenue.
-
-1.  **TVL Exposure**: Kiln manages approx. 550,000 ETH ($1.8B) in V1.
-2.  **Revenue at Risk**: Based on 4% APR and a 10% protocol fee, approximately 2,200 ETH ($7.2M) in commission is generated annually.
-3.  **Hostage State**: Sanctioned institutional users effectively "poison" their validator clones. The protocol's earned commission is trapped in the bytecode with no recovery path.
-
----
+## Likelihood Explanation
+The likelihood is **High** for an institutional-grade protocol like Kiln. In the current regulatory environment (OFAC, etc.), sanctions are a recurring and material risk. The vulnerability specifically triggers during the very events (sanctions) the protocol attempts to comply with, making it a systemic logic failure rather than an edge case.
 
 ## Proof of Concept
+I have provided a standalone Foundry repository to reproduce this issue.
 
-### Reproduction Steps
+**Reproduction Steps**:
 ```bash
 git clone https://github.com/OmachokoYakubu/kiln-treasury-hostage-poc
 cd kiln-treasury-hostage-poc
 forge test --match-path test/KilnTreasuryLock.t.sol -vvvv
 ```
 
-### Execution Trace
-The following trace confirms the `AddressSanctioned` revert occurs during a `withdraw()` call, aborting fee distribution:
+**Execution Trace**:
+The following trace confirms the `AddressSanctioned` revert occurs during an Admin-initiated `withdraw()` call, aborting the fee distribution:
 
 ```text
 Traces:
@@ -65,13 +51,8 @@ Traces:
     │   │   │   │   │   └─ ← [Revert] AddressSanctioned(0xDE)
 ```
 
----
-
-## Remediation
-I recommend implementing a fault-tolerant dispatch pattern using a `try/catch` block. This allows the protocol to salvage its revenue while safely escrowing the user's portion.
-
-### Implementation
-Modify `dispatch()` in the fee dispatchers:
+## Recommendation
+I recommend implementing a fault-tolerant dispatch pattern using a `try/catch` block to handle sanctions-related reverts gracefully. This ensures the protocol can salvage its revenue while safely escrowing the user's portion.
 
 ```solidity
 address withdrawer;
@@ -87,7 +68,8 @@ if (!isSanctioned) {
     (bool status, ) = withdrawer.call{value: balance - globalFee}("");
     if (!status) revert WithdrawerReceiveError();
 }
-// If sanctioned, protocol fee distribution continues below...
 ```
 
-This fix ensures protocol solvency is maintained even during sanctions events.
+---
+
+**Report Ends**
