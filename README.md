@@ -14,8 +14,10 @@ The Kiln V1 `SanctionsOracle` integration contains a logic flaw that causes prot
 
 ## Reproduction Instructions
 
-### 1. Build
+### 1. Clone and Setup
 ```bash
+git clone https://github.com/OmachokoYakubu/kiln-treasury-hostage-poc
+cd kiln-treasury-hostage-poc
 forge build
 ```
 
